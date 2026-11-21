@@ -1,4 +1,8 @@
 """端到端流程测试：补报/更正、因子优先级、预览-确认一致性、发布可见性。"""
+import os
+import sqlite3
+import threading
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -163,3 +167,168 @@ def test_factor_value_change_invalidates_preview(client):
     r = publish(client, p1["preview_id"])
     assert r.status_code == 409
     assert "factor" in r.json()["detail"]["changed"]
+
+
+# ---------- 并发交错：预览/确认与补报、因子更正 ----------
+
+def _raw_write(sql_and_params):
+    """模拟另一人用独立连接提交写入；短超时，拿不到写锁即报错。"""
+    conn = sqlite3.connect(os.environ["APP_DB"], timeout=0.2)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for sql, params in sql_and_params:
+            conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_preview_reads_single_committed_snapshot(client, monkeypatch):
+    """另一人「先改因子再补报电量」插在预览的两次读之间：
+    预览不得出现旧因子配新电量，快照必须对应同一个已提交状态。"""
+    upload(client, CSV1)
+    add_factor(client, "national", 2026, 0.5)
+
+    from app import services
+    original = services.resolve_factor
+    outcome = {"blocked": None}
+
+    def interfering_resolve(conn, province, year):
+        result = original(conn, province, year)  # 预览已读因子、尚未读电量
+        if outcome["blocked"] is None:
+            try:
+                _raw_write([  # 另一人的两次提交：改因子 + 补报新表
+                    ("UPDATE emission_factors SET factor=0.9 WHERE scope='national' AND year=2026", ()),
+                    ("INSERT INTO usage_records VALUES('江苏','2026-03','M03',50,'t')", ()),
+                ])
+                outcome["blocked"] = False
+            except sqlite3.OperationalError:
+                outcome["blocked"] = True  # 写锁在预览事务手里，并发提交进不来
+        return result
+
+    monkeypatch.setattr(services, "resolve_factor", interfering_resolve)
+    p = preview(client)
+
+    assert outcome["blocked"] is True  # 预览事务期间并发写被挡在事务外
+    assert [d["meter_no"] for d in p["details"]] == ["M01", "M02"]  # 没有混入新表
+    assert {d["factor_value"] for d in p["details"]} == {0.5}       # 仍是旧因子
+
+    # 预览事务结束后，另一人的提交正常入库，新预览看到一致的新状态
+    _raw_write([
+        ("UPDATE emission_factors SET factor=0.9 WHERE scope='national' AND year=2026", ()),
+        ("INSERT INTO usage_records VALUES('江苏','2026-03','M03',50,'t')", ()),
+    ])
+    p2 = preview(client)
+    assert [d["meter_no"] for d in p2["details"]] == ["M01", "M02", "M03"]
+    assert {d["factor_value"] for d in p2["details"]} == {0.9}
+
+
+def test_publish_validate_and_insert_are_atomic(client, monkeypatch):
+    """更正赶在确认发布的「校验」与「入库」之间提交：
+    不得让旧结果误发为最新版。"""
+    upload(client, CSV1)
+    add_factor(client, "national", 2026, 0.5)
+    p1 = preview(client)
+
+    from app import services
+    original = services.compute_payload
+    outcome = {"blocked": None}
+
+    def interfering_compute(conn, province, month):
+        payload = original(conn, province, month)  # 校验通过（与预览一致）
+        if outcome["blocked"] is None:
+            try:
+                _raw_write([  # 更正赶在入库前试图提交
+                    ("UPDATE usage_records SET kwh=999 WHERE province='江苏' AND month='2026-03' AND meter_no='M01'", ()),
+                ])
+                outcome["blocked"] = False
+            except sqlite3.OperationalError:
+                outcome["blocked"] = True
+        return payload
+
+    monkeypatch.setattr(services, "compute_payload", interfering_compute)
+    r = publish(client, p1["preview_id"])
+    assert r.status_code == 200
+    assert outcome["blocked"] is True  # 校验与入库同一事务，更正进不来
+
+    # 发布完成后再提交的更正正常入库；已发布内容不被修改
+    upload(client, "省份,月份,表号,千瓦时\n江苏,2026-03,M01,999\n")
+    pub = client.get("/api/published", params={"province": "江苏", "month": "2026-03"}).json()
+    assert {d["meter_no"]: d["kwh"] for d in pub["details"]} == {"M01": 100, "M02": 200}
+
+    # 更正已入库，原预览再确认必须 409
+    r = publish(client, p1["preview_id"])
+    assert r.status_code == 409
+    assert "usage" in r.json()["detail"]["changed"]
+
+
+def test_concurrent_previews_always_consistent(client):
+    """压力交错：写线程反复「先改因子、再改电量」（两次独立提交），
+    读线程连续预览；任何预览都不得出现旧因子配新电量。"""
+    upload(client, CSV1)
+    add_factor(client, "national", 2026, 1.0)
+
+    from app import services
+    from app.db import get_conn
+    stop = threading.Event()
+    errors = []
+
+    def writer():
+        i = 1
+        while not stop.is_set():
+            i += 1
+            with get_conn() as c:  # 第一次提交：改因子为第 i 轮
+                services.upsert_factor(c, "national", "", 2026, float(i))
+            with get_conn() as c:  # 第二次提交：更正电量为第 i 轮
+                services.upsert_usage(c, [
+                    {"province": "江苏", "month": "2026-03", "meter_no": "M01", "kwh": 100.0 + i}])
+
+    def reader():
+        try:
+            for _ in range(200):
+                with get_conn() as c:
+                    p = services.create_preview(c, "江苏", "2026-03")
+                d = {x["meter_no"]: x for x in p["details"]}
+                f_round = int(d["M01"]["factor_value"])      # 因子所属轮次
+                u_round = int(d["M01"]["kwh"] - 100.0)       # 电量所属轮次
+                if f_round < u_round:  # 旧因子配新电量：从未作为已提交状态存在
+                    errors.append(f"因子第{f_round}轮 × 电量第{u_round}轮")
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    t = threading.Thread(target=writer)
+    t.start()
+    reader()
+    stop.set()
+    t.join()
+    assert errors == []
+
+
+def test_other_province_uploads_during_accounting(client):
+    """逐表核算（预览/确认循环）期间，其他省月的补报照常入库。"""
+    upload(client, CSV1)
+    add_factor(client, "national", 2026, 0.5)
+    errors = []
+
+    def accountant():
+        try:
+            for _ in range(30):
+                r = publish(client, preview(client)["preview_id"])
+                assert r.status_code == 200, r.text
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    def reporter():
+        try:
+            for i in range(30):
+                r = upload(client, f"省份,月份,表号,千瓦时\n浙江,2026-03,M{i:02d},{i}\n")
+                assert r.status_code == 200, r.text
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    t1, t2 = threading.Thread(target=accountant), threading.Thread(target=reporter)
+    t1.start(); t2.start()
+    t1.join(); t2.join()
+    assert errors == []
+    rows = client.get("/api/usage", params={"province": "浙江", "month": "2026-03"}).json()["rows"]
+    assert len(rows) == 30  # 30 笔补报全部入库

@@ -6,6 +6,14 @@
 确认发布时重算当前 payload 与预览快照逐字节比对：
   - 不一致 -> 必须重新预览（哪怕排放总量相同）
   - 其他省份/月份/年份的数据变动不影响本快照，无需重新预览
+
+事务约定（配合 db.tx）：
+  - create_preview：读用电、读因子、存快照在同一个 IMMEDIATE 事务内完成，
+    预览的电量与所用因子必然对应同一个已提交状态；
+  - publish：校验（重算比对）与入库在同一个 IMMEDIATE 事务内完成，
+    提交前其他写者无法插入，杜绝「校验通过后、入库前被更正钻空」；
+  - 事务只在单次请求内存活（毫秒级），不跨请求持锁，
+    核算某省月期间其他省月的补报/因子维护照常入库（WAL 下读不阻塞写）。
 """
 import json
 import re
@@ -13,6 +21,8 @@ from datetime import datetime
 from sqlite3 import Connection
 
 from fastapi import HTTPException
+
+from .db import tx
 
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 EMISSIONS_DIGITS = 6  # kg CO2 保留小数位，保证快照可稳定比对
@@ -35,10 +45,10 @@ def year_of(month: str) -> int:
 # ---------- 用电明细 ----------
 
 def upsert_usage(conn: Connection, rows: list[dict]) -> dict:
-    """按 (省份, 月份, 表号) 覆盖写入：新键为补报，已有键为更正。"""
+    """按 (省份, 月份, 表号) 覆盖写入：新键为补报，已有键为更正。整批单事务。"""
     inserted, updated = 0, 0
     ts = now_iso()
-    with conn:
+    with tx(conn):
         for r in rows:
             cur = conn.execute(
                 "UPDATE usage_records SET kwh=?, updated_at=? "
@@ -83,7 +93,7 @@ def upsert_factor(conn: Connection, scope: str, province: str, year: int, factor
         raise HTTPException(422, "年份超出合理范围")
     if factor <= 0:
         raise HTTPException(422, "排放因子必须为正数")
-    with conn:
+    with tx(conn):
         conn.execute(
             "INSERT INTO emission_factors(scope, province, year, factor, updated_at)"
             " VALUES (?,?,?,?,?)"
@@ -105,7 +115,7 @@ def list_factors(conn: Connection, year: int | None = None) -> list[dict]:
 def delete_factor(conn: Connection, scope: str, province: str, year: int) -> bool:
     if scope == "national":
         province = ""
-    with conn:
+    with tx(conn):
         cur = conn.execute(
             "DELETE FROM emission_factors WHERE scope=? AND province=? AND year=?",
             (scope, province, year),
@@ -180,14 +190,18 @@ def _canonical(payload: dict) -> str:
 
 
 def create_preview(conn: Connection, province: str, month: str) -> dict:
-    payload = compute_payload(conn, province, month)
-    with conn:
+    # 单个 IMMEDIATE 事务内完成「读用电 + 读因子 + 存快照」：
+    # 预览的电量与所用因子对应同一个已提交状态，
+    # 期间其他连接的改因子/补报提交不进来，不会出现「旧因子算新电量」。
+    with tx(conn):
+        payload = compute_payload(conn, province, month)
         cur = conn.execute(
             "INSERT INTO previews(province, month, payload, publishable, created_at)"
             " VALUES (?,?,?,?,?)",
             (province, month, _canonical(payload), int(payload["publishable"]), now_iso()),
         )
-    return {"preview_id": cur.lastrowid, **payload}
+        preview_id = cur.lastrowid
+    return {"preview_id": preview_id, **payload}
 
 
 def _change_reasons(old: dict, new: dict) -> list[str]:
@@ -208,25 +222,28 @@ def _change_reasons(old: dict, new: dict) -> list[str]:
 
 
 def publish(conn: Connection, preview_id: int) -> dict:
-    row = conn.execute("SELECT * FROM previews WHERE id=?", (preview_id,)).fetchone()
-    if not row:
-        raise HTTPException(404, "预览不存在，请重新预览")
-    old_payload = json.loads(row["payload"])
-    current = compute_payload(conn, row["province"], row["month"])
-    if _canonical(current) != row["payload"]:
-        # 当期用电明细或所用因子来源/数值已变化（与总量是否相同无关）
-        raise HTTPException(409, detail={
-            "error": "预览后数据已变化，须重新预览后再确认",
-            "changed": _change_reasons(old_payload, current),
-        })
-    if not current["publishable"]:
-        year = current["year"]
-        raise HTTPException(422, detail={
-            "error": f"缺少 {current['province']} {year} 年省级及全国排放因子，请先补录，暂缓发布",
-            "missing_factors": current["missing_factors"],
-        })
-    # 单事务写入新发布快照；旧发布记录不被修改，提交前旧数据照常可查
-    with conn:
+    # 校验与入库在同一个 IMMEDIATE 事务：自 BEGIN 起其他写者无法提交，
+    # 因此「确认时比对的状态」就是「发布入库时的状态」，
+    # 赶在确认前后提交的更正要么被看到（409 要求重新预览）、要么等发布完成后才入库。
+    with tx(conn):
+        row = conn.execute("SELECT * FROM previews WHERE id=?", (preview_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "预览不存在，请重新预览")
+        old_payload = json.loads(row["payload"])
+        current = compute_payload(conn, row["province"], row["month"])
+        if _canonical(current) != row["payload"]:
+            # 当期用电明细或所用因子来源/数值已变化（与总量是否相同无关）
+            raise HTTPException(409, detail={
+                "error": "预览后数据已变化，须重新预览后再确认",
+                "changed": _change_reasons(old_payload, current),
+            })
+        if not current["publishable"]:
+            year = current["year"]
+            raise HTTPException(422, detail={
+                "error": f"缺少 {current['province']} {year} 年省级及全国排放因子，请先补录，暂缓发布",
+                "missing_factors": current["missing_factors"],
+            })
+        # 单事务写入新发布快照；旧发布记录不被修改，提交前旧数据照常可查
         cur = conn.execute(
             "INSERT INTO publications(province, month, preview_id, total_kwh, total_emissions, published_at)"
             " VALUES (?,?,?,?,?,?)",
@@ -245,17 +262,19 @@ def publish(conn: Connection, preview_id: int) -> dict:
 
 
 def latest_publication(conn: Connection, province: str, month: str) -> dict | None:
-    pub = conn.execute(
-        "SELECT * FROM publications WHERE province=? AND month=? ORDER BY id DESC LIMIT 1",
-        (province, month),
-    ).fetchone()
-    if not pub:
-        return None
-    details = conn.execute(
-        "SELECT meter_no, kwh, factor_source, factor_value, factor_year, emissions"
-        " FROM publication_details WHERE publication_id=? ORDER BY meter_no",
-        (pub["id"],),
-    ).fetchall()
+    # 单读事务：发布表头与逐表明细取自同一快照
+    with tx(conn, "DEFERRED"):
+        pub = conn.execute(
+            "SELECT * FROM publications WHERE province=? AND month=? ORDER BY id DESC LIMIT 1",
+            (province, month),
+        ).fetchone()
+        if not pub:
+            return None
+        details = conn.execute(
+            "SELECT meter_no, kwh, factor_source, factor_value, factor_year, emissions"
+            " FROM publication_details WHERE publication_id=? ORDER BY meter_no",
+            (pub["id"],),
+        ).fetchall()
     return {**dict(pub), "details": [dict(d) for d in details]}
 
 

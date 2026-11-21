@@ -1,6 +1,11 @@
-"""SQLite 连接与建表。数据库路径用环境变量 APP_DB 覆盖，默认 data/app.db。"""
+"""SQLite 连接与建表。数据库路径用环境变量 APP_DB 覆盖，默认 data/app.db。
+
+连接统一用 isolation_level=None（自动提交）：多语句操作必须用 tx() 显式
+界定事务，避免每条 SELECT 各自自动提交、同一操作内读到不同已提交状态。
+"""
 import os
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 _DEFAULT_DB = str(Path(__file__).resolve().parent.parent / "data" / "app.db")
@@ -63,11 +68,30 @@ def db_path() -> str:
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(), timeout=30)
+    # timeout=30：遇到写锁时最多等待 30 秒（WAL 下读不阻塞写）。
+    conn = sqlite3.connect(db_path(), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+@contextmanager
+def tx(conn: sqlite3.Connection, mode: str = "IMMEDIATE"):
+    """显式事务：事务内所有读看到同一个已提交快照。
+
+    IMMEDIATE（默认）在 BEGIN 时即取得写锁，事务提交前其他连接的写只能等待，
+    用于「读后写」的校验-入库序列（预览、确认发布及一切多语句写）。
+    DEFERRED 用于纯读操作的一致性快照（已发布查询）。
+    """
+    conn.execute(f"BEGIN {mode}")
+    try:
+        yield conn
+    except BaseException:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 def init_db() -> None:
