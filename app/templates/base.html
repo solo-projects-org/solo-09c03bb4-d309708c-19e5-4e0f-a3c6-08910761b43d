@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}集团购电碳排放盘查发布{% endblock %}</title>
+<style>
+  :root { --line:#d8dee4; --blue:#1f6feb; --red:#cf222e; --green:#1a7f37; }
+  * { box-sizing: border-box; }
+  body { font-family: "PingFang SC","Microsoft YaHei",system-ui,sans-serif; margin:0; color:#1f2328; background:#f6f8fa; }
+  nav { background:#24292f; padding:0 20px; display:flex; gap:4px; align-items:center; }
+  nav .brand { color:#fff; font-weight:600; padding:14px 16px 14px 0; }
+  nav a { color:#d0d7de; text-decoration:none; padding:14px 14px; display:inline-block; }
+  nav a:hover, nav a.active { color:#fff; border-bottom:2px solid var(--blue); }
+  main { max-width:1080px; margin:24px auto; padding:0 20px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:20px; margin-bottom:20px; }
+  h1 { font-size:20px; margin:0 0 16px; } h2 { font-size:16px; margin:0 0 12px; }
+  label { display:inline-block; margin:0 6px 8px 0; font-size:14px; }
+  select,input,button { font-size:14px; padding:6px 10px; border:1px solid var(--line); border-radius:6px; }
+  button { background:var(--blue); color:#fff; border-color:var(--blue); cursor:pointer; }
+  button:disabled { background:#94a3b8; border-color:#94a3b8; cursor:not-allowed; }
+  button.ghost { background:#fff; color:var(--blue); }
+  table { border-collapse:collapse; width:100%; margin-top:12px; font-size:14px; }
+  th,td { border:1px solid var(--line); padding:6px 10px; text-align:left; }
+  th { background:#f6f8fa; } td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  .msg { padding:10px 14px; border-radius:6px; margin:12px 0; font-size:14px; display:none; }
+  .msg.ok { display:block; background:#dafbe1; color:var(--green); border:1px solid #aceebb; }
+  .msg.err { display:block; background:#ffebe9; color:var(--red); border:1px solid #ffcecb; }
+  .msg.warn { display:block; background:#fff8c5; color:#7d4e00; border:1px solid #f0d879; }
+  .muted { color:#57606a; font-size:13px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; }
+  .field { display:flex; flex-direction:column; gap:4px; }
+</style>
+</head>
+<body>
+<nav>
+  <span class="brand">集团购电碳排放盘查</span>
+  <a href="/upload"    class="{{ 'active' if request.url.path == '/upload' }}">用电补报/更正</a>
+  <a href="/factors"   class="{{ 'active' if request.url.path == '/factors' }}">排放因子维护</a>
+  <a href="/preview"   class="{{ 'active' if request.url.path == '/preview' }}">预览与发布</a>
+  <a href="/published" class="{{ 'active' if request.url.path == '/published' }}">已发布查询</a>
+</nav>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>

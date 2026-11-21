@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>排放因子维护（千克 CO₂/千瓦时）</h1>
+  <p class="muted">省级因子按「省份+年度」维护，全国因子按「年度」维护；同年同范围重复保存即更新。发布时优先取同年省级因子，缺省用同年全国因子。</p>
+  <div class="row">
+    <div class="field"><label>范围</label>
+      <select id="scope" onchange="provField.style.display = scope.value==='province' ? '' : 'none'">
+        <option value="province">省级</option><option value="national">全国</option>
+      </select></div>
+    <div class="field" id="provField"><label>省份</label>
+      <select id="province">{% for p in provinces %}<option>{{ p }}</option>{% endfor %}</select></div>
+    <div class="field"><label>年度</label><input type="number" id="year" min="2000" max="2100" value="2026"></div>
+    <div class="field"><label>因子值</label><input type="number" id="factor" step="any" min="0" placeholder="如 0.5568"></div>
+    <button onclick="save()">保存</button>
+  </div>
+  <div id="msg" class="msg"></div>
+</div>
+<div class="card">
+  <h2>已维护因子</h2>
+  <div class="row">
+    <div class="field"><label>按年度筛选</label><input type="number" id="qyear" min="2000" max="2100"></div>
+    <button class="ghost" onclick="loadFactors()">查询</button>
+  </div>
+  <div id="list"></div>
+</div>
+<script>
+async function save() {
+  const body = {scope: scope.value, province: province.value, year: +year.value, factor: +factor.value};
+  const r = await fetch('/api/factors', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const d = await r.json();
+  msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
+  msg.textContent = r.ok ? `已保存：${d.scope==='national' ? '全国' : d.province} ${d.year} 年 = ${d.factor}` : (typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail));
+  loadFactors();
+}
+async function loadFactors() {
+  const p = qyear.value ? '?year=' + qyear.value : '';
+  const d = await (await fetch('/api/factors' + p)).json();
+  if (!d.rows.length) { list.innerHTML = '<p class="muted">暂无因子</p>'; return; }
+  list.innerHTML = '<table><tr><th>范围</th><th>省份</th><th>年度</th><th>因子值</th><th>更新时间</th><th></th></tr>' +
+    d.rows.map(r => `<tr><td>${r.scope === 'national' ? '全国' : '省级'}</td><td>${r.province || '—'}</td><td>${r.year}</td><td class="num">${r.factor}</td><td>${r.updated_at}</td>
+      <td><button class="ghost" onclick="del('${r.scope}','${r.province}',${r.year})">删除</button></td></tr>`).join('') + '</table>';
+}
+async function del(scope, prov, yr) {
+  if (!confirm(`删除 ${scope === 'national' ? '全国' : prov} ${yr} 年因子？`)) return;
+  const r = await fetch(`/api/factors?scope=${scope}&province=${encodeURIComponent(prov)}&year=${yr}`, {method:'DELETE'});
+  if (!r.ok) alert('删除失败');
+  loadFactors();
+}
+loadFactors();
+</script>
+{% endblock %}

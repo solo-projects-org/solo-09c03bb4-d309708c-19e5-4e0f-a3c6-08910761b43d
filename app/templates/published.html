@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>已发布明细查询</h1>
+  <p class="muted">展示每期最新一次发布的逐表排放与所用因子；新结果发布成功前，原已发布内容照常可查。</p>
+  <div class="row">
+    <div class="field"><label>省份</label>
+      <select id="province">{% for p in provinces %}<option>{{ p }}</option>{% endfor %}</select></div>
+    <div class="field"><label>月份</label><input type="month" id="month"></div>
+    <button class="ghost" onclick="query()">查询</button>
+  </div>
+  <div id="msg" class="msg"></div>
+  <div id="detail"></div>
+</div>
+<div class="card">
+  <h2>全部已发布期次</h2>
+  <div id="list"></div>
+</div>
+<script>
+const srcName = s => s === 'province' ? '省级' : '全国';
+async function query() {
+  if (!month.value) { msg.className='msg err'; msg.textContent='请选择月份'; return; }
+  const r = await fetch(`/api/published?province=${encodeURIComponent(province.value)}&month=${month.value}`);
+  const d = await r.json();
+  if (!r.ok) { msg.className='msg warn'; msg.textContent = typeof d.detail === 'string' ? d.detail : '查询失败'; detail.innerHTML=''; return; }
+  msg.className='msg ok';
+  msg.textContent = `发布 #${d.id}，发布时间 ${d.published_at}，合计 ${d.total_kwh} 千瓦时、${d.total_emissions} kg CO₂`;
+  detail.innerHTML = '<table><tr><th>表号</th><th>千瓦时</th><th>因子来源</th><th>因子值</th><th>因子年度</th><th>排放量(kg CO₂)</th></tr>' +
+    d.details.map(x => `<tr><td>${x.meter_no}</td><td class="num">${x.kwh}</td><td>${srcName(x.factor_source)}</td>
+      <td class="num">${x.factor_value}</td><td>${x.factor_year}</td><td class="num">${x.emissions}</td></tr>`).join('') + '</table>';
+}
+async function loadList() {
+  const d = await (await fetch('/api/published/list')).json();
+  if (!d.rows.length) { list.innerHTML = '<p class="muted">暂无发布</p>'; return; }
+  list.innerHTML = '<table><tr><th>省份</th><th>月份</th><th>合计千瓦时</th><th>合计排放(kg CO₂)</th><th>发布时间</th></tr>' +
+    d.rows.map(r => `<tr><td>${r.province}</td><td>${r.month}</td><td class="num">${r.total_kwh}</td>
+      <td class="num">${r.total_emissions}</td><td>${r.published_at}</td></tr>`).join('') + '</table>';
+}
+loadList();
+</script>
+{% endblock %}

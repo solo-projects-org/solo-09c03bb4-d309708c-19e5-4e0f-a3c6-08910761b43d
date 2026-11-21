@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>预览与发布</h1>
+  <p class="muted">选择省份和月份生成预览；确认时若当期用电明细或所用因子的来源/数值与预览不一致，系统会要求重新预览。</p>
+  <div class="row">
+    <div class="field"><label>省份</label>
+      <select id="province">{% for p in provinces %}<option>{{ p }}</option>{% endfor %}</select></div>
+    <div class="field"><label>月份</label><input type="month" id="month"></div>
+    <button onclick="doPreview()">生成预览</button>
+    <button id="confirmBtn" onclick="doConfirm()" disabled>确认发布</button>
+  </div>
+  <div id="msg" class="msg"></div>
+</div>
+<div class="card" id="previewCard" style="display:none">
+  <h2 id="previewTitle"></h2>
+  <div id="previewBody"></div>
+</div>
+<script>
+let currentPreview = null;
+
+function renderPreview(d) {
+  currentPreview = d;
+  previewCard.style.display = '';
+  previewTitle.textContent = `${d.province} ${d.month}（${d.details.length} 块表）`;
+  const srcName = s => s === 'province' ? '省级' : (s === 'national' ? '全国' : '—');
+  let html = '<table><tr><th>表号</th><th>千瓦时</th><th>因子来源</th><th>因子值</th><th>排放量(kg CO₂)</th></tr>';
+  html += d.details.map(r => `<tr><td>${r.meter_no}</td><td class="num">${r.kwh}</td><td>${srcName(r.factor_source)}</td>
+    <td class="num">${r.factor_value ?? '—'}</td><td class="num">${r.emissions ?? '—'}</td></tr>`).join('');
+  html += `<tr><th>合计</th><th class="num">${d.total_kwh}</th><th></th><th></th><th class="num">${d.total_emissions}</th></tr></table>`;
+  previewBody.innerHTML = html;
+  confirmBtn.disabled = !d.publishable;
+  if (!d.details.length) { msg.className='msg warn'; msg.textContent='该期没有用电明细，请先在「用电补报/更正」上传。'; }
+  else if (!d.publishable) { msg.className='msg err'; msg.textContent=`缺少 ${d.province} ${d.year} 年省级及全国排放因子，请先在「排放因子维护」补录，暂缓发布。`; }
+  else { msg.className='msg ok'; msg.textContent='预览已生成，可确认发布。'; }
+}
+
+async function doPreview() {
+  if (!month.value) { msg.className='msg err'; msg.textContent='请选择月份'; return; }
+  const r = await fetch('/api/preview', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({province: province.value, month: month.value})});
+  const d = await r.json();
+  if (!r.ok) { msg.className='msg err'; msg.textContent = typeof d.detail === 'string' ? d.detail : JSON.stringify(d.detail); return; }
+  renderPreview(d);
+}
+
+async function doConfirm() {
+  if (!currentPreview) return;
+  const r = await fetch('/api/publish', {method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({preview_id: currentPreview.preview_id})});
+  const d = await r.json();
+  if (r.ok) {
+    msg.className='msg ok';
+    msg.textContent = `发布成功（#${d.publication_id}）：${d.province} ${d.month}，合计 ${d.total_kwh} 千瓦时、${d.total_emissions} kg CO₂。`;
+    confirmBtn.disabled = true;
+  } else if (r.status === 409) {
+    msg.className='msg err';
+    msg.textContent = d.detail.error + '（变化：' + d.detail.changed.map(c => c === 'usage' ? '用电明细' : '所用因子').join('、') + '）。已自动重新生成预览，请核对后再确认。';
+    doPreview();
+  } else {
+    msg.className='msg err';
+    msg.textContent = typeof d.detail === 'string' ? d.detail : (d.detail && d.detail.error) || JSON.stringify(d.detail);
+  }
+}
+</script>
+{% endblock %}

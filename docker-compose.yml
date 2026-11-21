@@ -1,0 +1,13 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      APP_DB: /data/app.db
+    volumes:
+      - carbon-data:/data
+    restart: unless-stopped
+
+volumes:
+  carbon-data:

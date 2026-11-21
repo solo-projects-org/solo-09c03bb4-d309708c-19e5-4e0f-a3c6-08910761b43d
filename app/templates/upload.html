@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>上传电表用电 CSV（补报 / 更正）</h1>
+  <p class="muted">表头：<code>省份,月份,表号,千瓦时</code>（月份格式 YYYY-MM）。同一省份+月份+表号重复上传视为更正，新表号视为补报。</p>
+  <div class="row">
+    <div class="field"><label>CSV 文件（UTF-8）</label><input type="file" id="file" accept=".csv"></div>
+    <button onclick="doUpload()">上传</button>
+  </div>
+  <div id="msg" class="msg"></div>
+</div>
+<div class="card">
+  <h2>当前用电明细查询</h2>
+  <div class="row">
+    <div class="field"><label>省份</label>
+      <select id="qprov"><option value="">全部</option>{% for p in provinces %}<option>{{ p }}</option>{% endfor %}</select></div>
+    <div class="field"><label>月份</label><input type="month" id="qmonth"></div>
+    <button class="ghost" onclick="query()">查询</button>
+  </div>
+  <div id="result"></div>
+</div>
+<script>
+async function doUpload() {
+  const f = document.getElementById('file').files[0];
+  const msg = document.getElementById('msg');
+  if (!f) { msg.className='msg err'; msg.textContent='请先选择文件'; return; }
+  const fd = new FormData(); fd.append('file', f);
+  const r = await fetch('/api/usage/upload', {method:'POST', body:fd});
+  const d = await r.json();
+  if (r.ok) { msg.className='msg ok'; msg.textContent=`成功：补报 ${d.inserted} 条，更正 ${d.updated} 条`; query(); }
+  else {
+    const det = d.detail;
+    msg.className='msg err';
+    msg.textContent = det && det.rows ? det.error + '：' + det.rows.join('；') : (typeof det === 'string' ? det : JSON.stringify(det));
+  }
+}
+async function query() {
+  const p = new URLSearchParams();
+  if (qprov.value) p.set('province', qprov.value);
+  if (qmonth.value) p.set('month', qmonth.value);
+  const d = await (await fetch('/api/usage?' + p)).json();
+  if (!d.rows.length) { result.innerHTML = '<p class="muted">无记录</p>'; return; }
+  result.innerHTML = '<table><tr><th>省份</th><th>月份</th><th>表号</th><th>千瓦时</th><th>更新时间</th></tr>' +
+    d.rows.map(r => `<tr><td>${r.province}</td><td>${r.month}</td><td>${r.meter_no}</td><td class="num">${r.kwh}</td><td>${r.updated_at}</td></tr>`).join('') + '</table>';
+}
+</script>
+{% endblock %}
